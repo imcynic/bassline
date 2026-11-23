@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""lg-setup — put an LG Sound Suite speaker on Wi-Fi from Linux, without the ThinQ app.
+
+Put the speaker in setup/pairing mode first, then:
+    lg-setup scan                    list speakers in setup mode
+    lg-setup info                    connect and show the speaker's Wi-Fi MAC and current network
+    lg-setup wifi --ssid MyNetwork   send Wi-Fi credentials (password is prompted, never echoed)
+    lg-setup encode --ssid X         dry run: show the exact packets that would be sent
+
+Protocol notes: NOTES.md. Reimplemented from the ThinQ Android app's BLE provisioning code.
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from lgsuite import codec  # noqa: E402
+
+IS_TTY = sys.stdout.isatty()
+
+
+def c(text: str, color: str) -> str:
+    if not IS_TTY or os.environ.get("NO_COLOR"):
+        return text
+    codes = {"green": "32", "red": "31", "yellow": "33", "dim": "2", "bold": "1", "cyan": "36"}
+    return f"\033[{codes[color]}m{text}\033[0m"
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(c("error: ", "red") + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+# --- Wi-Fi helpers (NetworkManager, optional) -------------------------------------
+def nmcli_networks(rescan: bool = False) -> list[tuple[str, str, int]]:
+    """[(ssid, bssid, signal)] from NetworkManager, strongest first. Empty if unavailable."""
+    if not shutil.which("nmcli"):
+        return []
+    cmd = ["nmcli", "-t", "-e", "yes", "-f", "SSID,BSSID,SIGNAL", "dev", "wifi", "list",
+           "--rescan", "yes" if rescan else "auto"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=20).stdout
+    except (subprocess.SubprocessError, OSError):
+        return []
+    nets = []
+    for line in out.splitlines():
+        fields = [f.replace("\\:", ":").replace("\\\\", "\\") for f in re.split(r"(?<!\\):", line)]
+        if len(fields) != 3 or not fields[0]:
+            continue
+        try:
+            nets.append((fields[0], fields[1].upper(), int(fields[2])))
+        except ValueError:
+            continue
+    nets.sort(key=lambda n: -n[2])
+    return nets
+
+
+def resolve_bssid(choice: str, ssid: str) -> tuple[str, str]:
+    """Return (bssid, explanation)."""
+    if choice.lower() == "none":
+        return codec.UNKNOWN_BSSID, "not sent (speaker picks the access point itself)"
+    if choice.lower() != "auto":
+        if not codec.parse_mac(choice):
+            die(f"--bssid must be auto, none, or a MAC like AA:BB:CC:DD:EE:FF (got {choice!r})", 2)
+        return choice.upper(), "as given"
+    for net_ssid, bssid, signal in nmcli_networks():
+        if net_ssid == ssid:
+            return bssid, f"strongest access point for {ssid!r} seen from this PC ({signal}% signal)"
+    return codec.UNKNOWN_BSSID, "not sent (this PC can't see the network over Wi-Fi; the speaker will scan for it)"
+
+
+def get_password(args) -> str:
+    if args.open:
+        return ""
+    if args.password_stdin:
+        pw = sys.stdin.readline().rstrip("\r\n")
+    else:
+        if not sys.stdin.isatty():
+            die("no terminal to prompt for the password; use --password-stdin or --open", 2)
+        pw = getpass.getpass(f"Wi-Fi password for {args.ssid!r}: ")
+    if not pw:
+        die("empty password; use --open for a network without a password", 2)
+    if len(pw.encode()) > 64:
+        die("password longer than 64 bytes; Wi-Fi (WPA) doesn't allow that", 2)
+    if len(pw) < 8:
+        print(c("warning: ", "yellow") + "WPA passwords are at least 8 characters; double-check it.")
+    return pw
+
+
+def get_ssid(args) -> str:
+    if args.ssid:
+        ssid = args.ssid
+    else:
+        if not sys.stdin.isatty():
+            die("--ssid is required", 2)
+        nets = []
+        seen = set()
+        for s, _, _ in nmcli_networks():
+            if s not in seen:
+                seen.add(s)
+                nets.append(s)
+        if nets:
+            print("Networks this PC can see: " + ", ".join(nets[:8]))
+        ssid = input("Wi-Fi network name (SSID): ").strip()
+    if not ssid:
+        die("no network name given", 2)
+    if len(ssid.encode()) > 32:
+        die("network names are at most 32 bytes", 2)
+    return ssid
+
+
+# --- Speaker selection ------------------------------------------------------------
+def pick_speaker(bz, args):
+    print(c(f"Scanning for speakers in setup mode ({args.scan_time:.0f}s)…", "dim"))
+    found = bz.scan(args.scan_time, stop_on_first=False if (args.device or args.choose) else "setup")
+    if args.device:
+        want = args.device.lower()
+        found = [s for s in found if want in s.address.lower()
+                 or want in s.beacon.get("wifi_direct_mac", "").lower()
+                 or want == s.beacon.get("bt_mac_suffix", "").lower()]
+    normal = [s for s in found if s.mode == "normal"]
+    found = [s for s in found if s.mode != "normal"]
+    if not found and normal:
+        die(f"found {', '.join(s.name for s in normal)}, but not in setup mode (it's in normal "
+            "Bluetooth/Wi-Fi mode).\n  Put it in setup/pairing mode — the mode the ThinQ app "
+            "looks for — and run this again.", 2)
+    if not found:
+        die("no Sound Suite speaker in setup mode found.\n"
+            "  • Put the speaker in setup/pairing mode (the mode the ThinQ app looks for).\n"
+            "  • Stay within a few metres; try a longer --scan-time.", 2)
+    if len(found) == 1:
+        return found[0]
+    print("Several speakers found:")
+    for i, s in enumerate(found, 1):
+        print(f"  {i}) {s.label}  rssi {s.rssi}")
+    if not sys.stdin.isatty():
+        die("several speakers found; pick one with --device", 2)
+    while True:
+        ans = input(f"Which one? [1-{len(found)}]: ").strip()
+        if ans.isdigit() and 1 <= int(ans) <= len(found):
+            return found[int(ans) - 1]
+
+
+# --- Session helpers ------------------------------------------------------------
+def handshake(sess, log) -> dict:
+    """Do what the app does right after connecting: notifications, hello, read MAC, ask SSID."""
+    info: dict = {}
+    sess.start_notify()
+    sess.write(codec.CHAR_LG_APP, codec.encode_str(codec.HELLO))
+    if codec.CHAR_WIFI_MAC in sess.chars:
+        try:
+            info["wifi_mac"] = codec.decode_wifi_mac_read(sess.read(codec.CHAR_WIFI_MAC))
+        except Exception as e:  # noqa: BLE001 — informational only
+            log(c(f"  (could not read Wi-Fi MAC: {e})", "dim"))
+    sess.write(codec.CHAR_COMMAND, codec.encode_str(codec.CMD_GET_SSID))
+    ssid_bytes = bytearray()
+    done = {"ssid": False}
+
+    def drain():
+        for raw in sess.take_notifications():
+            n = codec.parse_notification(raw)
+            if n.code == "F":
+                if n.ssid_part:
+                    ssid_bytes.extend(n.ssid_part)
+                if n.ssid_last:
+                    done["ssid"] = True
+            elif n.code == "J" and n.wifi_mac and not info.get("wifi_mac"):
+                info["wifi_mac"] = n.wifi_mac
+            elif n.code == "D":
+                info["rssi"] = n.rssi
+            else:
+                info.setdefault("states", []).append(n)
+        return done["ssid"]
+
+    sess.bz.pump(4.0, until=drain)
+    drain()
+    info["connected_ssid"] = ssid_bytes.decode("utf-8", "replace") if ssid_bytes else None
+    return info
+
+
+def print_info(speaker, info: dict) -> None:
+    print(c("Speaker", "bold") + f"  {speaker.name}")
+    print(f"  BLE address      {speaker.address} ({speaker.address_type or '?'}, changes over time)")
+    if speaker.beacon.get("wifi_direct_mac"):
+        print(f"  Wi-Fi Direct MAC {speaker.beacon['wifi_direct_mac']}")
+    print(f"  Wi-Fi MAC        {info.get('wifi_mac') or c('unknown', 'dim')}")
+    cur = info.get("connected_ssid")
+    print(f"  Current network  {cur if cur else c('none reported', 'dim')}")
+    if info.get("rssi"):
+        print(f"  Signal           {info['rssi']}")
+    for n in info.get("states", []):
+        print(f"  status           {n}")
+
+
+def monitor(sess, timeout: float, log) -> int:
+    """Watch status notifications after sending credentials. Returns an exit code."""
+    state = {"last": None, "result": None, "fail_at": None, "fail": None, "noinet_at": None}
+    t0 = time.monotonic()
+
+    def step():
+        now = time.monotonic()
+        for raw in sess.take_notifications():
+            n = codec.parse_notification(raw)
+            if n.code in ("F", "J", "E", "I"):
+                continue
+            if n.code != state["last"] or n.code == "D":
+                colour = "green" if n.code in ("A", "B") else "red" if n.code in codec.FAILURE_CODES else "cyan"
+                log(f"  {now - t0:5.1f}s  " + c(str(n), colour))
+                state["last"] = n.code
+            if n.code == codec.SUCCESS_CODE:
+                state["result"] = 0
+                return True
+            if n.code == codec.NO_INTERNET_CODE:
+                state["noinet_at"] = state["noinet_at"] or now
+            if n.code in codec.FAILURE_CODES:
+                state["fail_at"], state["fail"] = now, n
+            elif n.code in codec.PROGRESS_CODES:
+                state["fail_at"] = None  # speaker recovered / retrying
+        # Give a failure 6s in case the speaker retries on its own.
+        if state["fail_at"] and now - state["fail_at"] > 6:
+            state["result"] = 1
+            return True
+        # Joined Wi-Fi without internet: wait a little for 'B', then accept.
+        if state["noinet_at"] and now - state["noinet_at"] > 10:
+            state["result"] = 3
+            return True
+        return False
+
+    sess.bz.pump(timeout, until=step)
+    if state["result"] is None:
+        if state["noinet_at"]:
+            return 3
+        log(c(f"No final answer from the speaker within {timeout:.0f}s.", "yellow"))
+        return 4
+    if state["result"] == 1:
+        n = state["fail"]
+        hint = {
+            "3": "Check the password (case-sensitive) and try again.",
+            "6": "Check the network name. Some speakers only see 2.4/5 GHz networks; move closer to the router.",
+            "9": "The router's security mode isn't supported (e.g. WPA3-only). Try WPA2/WPA3 mixed mode.",
+        }.get(n.code, "Try again closer to the router, or power-cycle the speaker.")
+        log(c(f"Setup failed: {n.text}. ", "red") + hint)
+    return state["result"]
+
+
+def find_on_lan(seconds: float = 8.0) -> list[str]:
+    """Look for LG speakers announcing _lg-smart-device._tcp via Avahi."""
+    if not shutil.which("avahi-browse"):
+        return []
+    try:
+        out = subprocess.run(["avahi-browse", "-rpt", "_lg-smart-device._tcp"],
+                             capture_output=True, text=True, timeout=seconds).stdout
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+    except OSError:
+        return []
+    hits = []
+    for line in out.splitlines():
+        f = line.split(";")
+        if f[0] == "=" and len(f) >= 9 and f[2] == "IPv4":
+            hits.append(f"{f[3]}  {f[7]}:{f[8]}")
+    return sorted(set(hits))
+
+
+# --- Commands ---------------------------------------------------------------------
+def cmd_encode(args) -> int:
+    ssid = get_ssid(args)
+    pw = get_password(args)
+    bssid, why = resolve_bssid(args.bssid, ssid)
+    connect_cmd = codec.CMD_CONNECT_SECURED if pw else codec.CMD_CONNECT_OPEN
+    # (characteristic, label shown, plaintext bytes, packets, hide packets?)
+    steps = [
+        ("LG_APP", codec.HELLO, codec.HELLO.encode(), codec.encode_str(codec.HELLO), False),
+        ("COMMAND", codec.CMD_GET_SSID, codec.CMD_GET_SSID.encode(), codec.encode_str(codec.CMD_GET_SSID), False),
+        ("SSID", ssid, ssid.encode(), codec.encode_str(ssid), False),
+        ("PASSWD", "•" * len(pw), pw.encode(), codec.encode_str(pw), not args.show_secrets),
+        ("SECURITY", f"BSSID {bssid}", b"\x00" + codec.parse_mac(bssid), codec.encode_bssid(bssid), False),
+        ("COMMAND", connect_cmd, connect_cmd.encode(), codec.encode_str(connect_cmd), False),
+    ]
+    print(c(f"BSSID: {why}", "dim"))
+    for name, label, plain, pkts, hide in steps:
+        if not pkts:
+            print(f"{name:9} (skipped, empty)")
+            continue
+        assert codec.decode(pkts) == plain, f"round-trip mismatch for {name}"
+        print(f"{name:9} {label!r}")
+        for p in pkts:
+            print("          " + (f"<{len(p)} bytes>" if hide else p.hex(" ")))
+    return 0
+
+
+class SpeakerSession:
+    """Scan, connect, and on exit disconnect *and* restore any Bluetooth audio that dropped.
+
+    The M7 drops its Bluetooth-audio (A2DP) link when a setup session connects, which
+    silently moves the PC's sound elsewhere. We remember what was connected and put it back.
+    """
+
+    def __init__(self, args):
+        self.args = args
+
+    def __enter__(self):
+        from lgsuite.ble import BlueZ, GattSession
+        self.bz = BlueZ(self.args.adapter)
+        self.audio_before = self.bz.connected_audio_devices()
+        self.speaker = pick_speaker(self.bz, self.args)
+        if self.audio_before:
+            print(c("Note: the speaker may drop Bluetooth audio during setup; "
+                    "it will be reconnected afterwards.", "dim"))
+        print(f"Connecting to {self.speaker.label}…")
+        self.sess = GattSession(self.bz, self.speaker, log=print, verbose=self.args.verbose)
+        try:
+            self.sess.connect()
+        except BaseException:
+            self._restore()
+            raise
+        return self.speaker, self.sess
+
+    def _restore(self):
+        if self.audio_before:
+            self.bz.pump(1.5)
+            self.bz.reconnect(self.audio_before)
+
+    def __exit__(self, *exc):
+        try:
+            self.sess.close()
+        finally:
+            self._restore()
+        return False
+
+
+def cmd_scan(args) -> int:
+    from lgsuite.ble import BlueZ
+    bz = BlueZ(args.adapter)
+    print(c(f"Scanning for {args.scan_time:.0f}s…", "dim"))
+    found = bz.scan(args.scan_time)
+    if not found:
+        print("No Sound Suite speakers in setup mode found.")
+        return 2
+    for s in found:
+        mode = {"setup": c("setup mode", "green"), "normal": c("normal mode", "yellow")}.get(s.mode, s.mode)
+        line = f"{s.name:16} {s.address}  rssi {s.rssi if s.rssi is not None else '?':>4}  {mode}"
+        if s.mode == "setup":
+            line += f"  wifi-direct {s.beacon.get('wifi_direct_mac')}  bt …{s.beacon.get('bt_mac_suffix')}"
+        print(line)
+    if not any(s.mode == "setup" for s in found):
+        print(c("No speaker is in setup mode; `info` and `wifi` need setup mode.", "dim"))
+    return 0
+
+
+def cmd_info(args) -> int:
+    with SpeakerSession(args) as (speaker, sess):
+        info = handshake(sess, print)
+        print_info(speaker, info)
+    return 0
+
+
+def cmd_wifi(args) -> int:
+    ssid = get_ssid(args)
+    pw = get_password(args)
+    bssid, why = resolve_bssid(args.bssid, ssid)
+    print(c(f"Router BSSID: {bssid} — {why}", "dim"))
+    with SpeakerSession(args) as (speaker, sess):
+        info = handshake(sess, print)
+        print_info(speaker, info)
+        # The speaker reports a *saved* SSID even when it isn't actually connected,
+        # so a matching name is not a reason to skip.
+        if info.get("connected_ssid") == ssid:
+            print(c(f"Speaker already has {ssid!r} saved; resending the settings.", "dim"))
+        print(f"Sending Wi-Fi settings for {ssid!r}…")
+        sess.take_notifications()
+        sess.write(codec.CHAR_SSID, codec.encode_str(ssid))
+        if pw:
+            sess.write(codec.CHAR_PASSWD, codec.encode_str(pw), redact=True)
+        sess.write(codec.CHAR_SECURITY, codec.encode_bssid(bssid))
+        sess.write(codec.CHAR_COMMAND,
+                   codec.encode_str(codec.CMD_CONNECT_SECURED if pw else codec.CMD_CONNECT_OPEN))
+        print("Waiting for the speaker to join…")
+        rc = monitor(sess, args.timeout, print)
+    if rc == 0:
+        print(c(f"Done: the speaker is on {ssid!r}.", "green"))
+    elif rc == 3:
+        print(c(f"The speaker joined {ssid!r} but reports no internet access.", "yellow"))
+    if rc in (0, 3) and not args.no_lan_check:
+        hits = find_on_lan()
+        if hits:
+            print("Found on the network:")
+            for h in hits:
+                print("  " + h)
+        else:
+            print(c("It isn't announcing itself on this PC's network yet (give it a minute; "
+                    "a firewall blocking mDNS can also hide it).", "dim"))
+    return rc
+
+
+def main() -> int:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("-v", "--verbose", action="store_true", help="show every packet")
+    common.add_argument("--adapter", help="Bluetooth adapter, e.g. hci0 (default: first)")
+    common.add_argument("--scan-time", type=float, default=10.0, help="seconds to scan (default 10)")
+    common.add_argument("--device", help="pick a speaker by BLE address, Wi-Fi Direct MAC, or BT MAC suffix")
+    common.add_argument("--choose", action="store_true", help="scan the full time and choose between speakers")
+
+    p = argparse.ArgumentParser(prog="lg-setup", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("scan", parents=[common], help="list speakers in setup mode")
+    sub.add_parser("info", parents=[common], help="connect and show Wi-Fi MAC and current network")
+
+    def wifi_args(sp):
+        sp.add_argument("--ssid", help="network name (prompted if omitted)")
+        g = sp.add_mutually_exclusive_group()
+        g.add_argument("--open", action="store_true", help="network has no password")
+        g.add_argument("--password-stdin", action="store_true", help="read the password from stdin")
+        sp.add_argument("--bssid", default="auto",
+                        help="router access point MAC: auto (default), none, or AA:BB:CC:DD:EE:FF")
+
+    w = sub.add_parser("wifi", parents=[common], help="send Wi-Fi credentials to the speaker")
+    wifi_args(w)
+    w.add_argument("--timeout", type=float, default=90.0, help="seconds to wait for the result (default 90)")
+    w.add_argument("--no-lan-check", action="store_true", help="don't look for the speaker on the network afterwards")
+
+    e = sub.add_parser("encode", parents=[common], help="dry run: print the packets without any Bluetooth")
+    wifi_args(e)
+    e.add_argument("--show-secrets", action="store_true", help="also print the password packets")
+
+    args = p.parse_args()
+    handlers = {"scan": cmd_scan, "info": cmd_info, "wifi": cmd_wifi, "encode": cmd_encode}
+    try:
+        return handlers[args.cmd](args)
+    except KeyboardInterrupt:
+        print("\ninterrupted")
+        return 130
+    except Exception as ex:  # noqa: BLE001
+        from lgsuite.ble import BleError
+        if isinstance(ex, BleError):
+            die(str(ex))
+        raise
+
+
+if __name__ == "__main__":
+    sys.exit(main())

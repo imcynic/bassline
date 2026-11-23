@@ -1,0 +1,11 @@
+# LG app material and local tooling — never commit
+apk/
+decompiled/
+tools/
+jadx.log
+# personal research notes (home network names, MACs)
+NOTES.md
+sdp_records.txt
+__pycache__/
+*.pyc
+dist/
